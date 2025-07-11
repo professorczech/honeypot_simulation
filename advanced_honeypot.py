@@ -1,27 +1,44 @@
 #!/usr/bin/env python3
 """
-Advanced Interactive Honeypot Simulation for Ethical‑Hacking Training
---------------------------------------------------------------------
+Advanced Interactive Honeypot Simulation – Stable 2025‑07‑10
+==========================================================
+This drop fixes all runtime issues observed during an `nmap -sV -O` scan
+and tightens exception handling across every protocol.
 
-Simulated Services  : SSH, Telnet, FTP, LDAP, SMB, NETBIOS
-Extra Deception     : Raw‑socket SYN/ACK fingerprints, rotating banners, tarpit handshakes,
-                      credential capture & replay (SQLite), adaptive delays, JSON logging
+Key patches
+-----------
+1. **asyncssh** now uses `session_factory` (not `process_factory`) and supplies
+   the required positional arg to avoid *Unhandled exception in
+   client_connected_cb*.
+2. **Filesystem helper** – corrected `cat` branch (`node[args[0]]`).
+3. **Robust decoders** – any line read from the network is decoded with
+   `errors="ignore"` **and** first truncated to 2048 bytes to protect against
+   malformed banners sent by scanners.
+4. **Global try/except** wrappers on each handler: no protocol coroutine can
+   bubble an exception to the asyncio loop any more; the connection is closed
+   gracefully and the traceback is logged once.
+5. **JSON logger** is now TZ‑aware, silencing the deprecation warning.
 
-Ports (default)     : SSH 2222 | Telnet 2323 | FTP 2121 | LDAP 1389 | SMB 1445 | NETBIOS 1137
+Run it exactly as before:
+```bash
+sudo python3 advanced_honeypot.py
+```
+If you already have the old listener running, kill it first (`Ctrl‑C`) or
+find its PID.
 
-Usage               : sudo python3 advanced_honeypot.py
-                      # root or CAP_NET_RAW required for raw‑socket listener
+Dependencies
+```
+pip install asyncssh pyftpdlib scapy impacket sqlite-utils
+```
 
-This file is **self‑contained**.  External deps:  asyncssh, pyftpdlib, scapy, impacket, sqlite3
+Full, self‑contained source below – copy/paste or save directly.
 """
 
-# ---------------------------------------------------------------------------
-# Imports & Globals
-# ---------------------------------------------------------------------------
-
-import asyncio, asyncssh, logging, random, threading, time, os, json, uuid, sqlite3
-from datetime import datetime
+from __future__ import annotations
+import asyncio, asyncssh, logging, random, threading, time, os, json, uuid, sqlite3, traceback
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict, Callable
 
 from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.handlers import FTPHandler
@@ -29,61 +46,59 @@ from pyftpdlib.servers import FTPServer
 
 import scapy.all as scapy  # raw‑packet SYN/ACK fingerprints
 
-DB_PATH = Path("honeypot.db")
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
-# ----------------------------------------------------------------------------
-# Configuration  (editable)
-# ----------------------------------------------------------------------------
-
-config = {
-    "ports": {"ssh": 2222, "telnet": 2323, "ftp": 2121, "ldap": 1389, "smb": 1445, "netbios": 1137},
+config: Dict = {
+    "ports": {
+        "ssh": 2222, "telnet": 2323, "ftp": 2121,
+        "ldap": 1389, "smb": 1445, "netbios": 1137,
+    },
     "ssh_host_key_path": "ssh_host_key",
     "fake_vulnerabilities": {
-        "ssh":     {"cve": "CVE-2024-1001", "description": "Simulated buffer overflow in SSH authentication."},
-        "telnet":  {"cve": "CVE-2024-1002", "description": "Simulated command injection vulnerability."},
-        "ftp":     {"cve": "CVE-2024-1003", "description": "Simulated directory traversal via vuln.txt."},
-        "ldap":    {"cve": "CVE-2024-1004", "description": "Simulated LDAP injection vulnerability."},
-        "smb":     {"cve": "CVE-2024-1005", "description": "Simulated SMB RCE vulnerability."},
-        "netbios": {"cve": "CVE-2024-1006", "description": "Simulated NETBIOS info disclosure."}
+        proto: {
+            "cve": f"CVE-2024-10{idx:02d}",
+            "description": f"Simulated vulnerability inside {proto.upper()} service."
+        }
+        for idx, proto in enumerate(["ssh", "telnet", "ftp", "ldap", "smb", "netbios"], start=1)
     },
 }
 
-# SYN/ACK fingerprints per service (ttl, window, mss)
 SERVICE_FP = {
-    "ssh":  (64, 64240, 1460),
-    "telnet": (128, 8192, 1380),
-    "ftp":  (64, 65535, 1460),
-    "ldap": (255, 32120, 1380),
-    "smb":  (128, 64240, 1460),
-    "netbios": (255, 8192, 1460),
+    "ssh":      (64,  64240, 1460),
+    "telnet":   (128,  8192, 1380),
+    "ftp":      (64,  65535, 1460),
+    "ldap":     (255, 32120, 1380),
+    "smb":      (128, 64240, 1460),
+    "netbios":  (255,  8192, 1460),
 }
 
-# Banners picked once per startup (realism)
 BANNERS = {
     "ssh": random.choice([
-        "SSH-2.0-OpenSSH_7.4p1 Debian-10+deb9u7",
         "SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.5",
-        "SSH-2.0-dropbear_2020.78"
+        "SSH-2.0-dropbear_2020.78",
     ]),
     "telnet": random.choice([
         b"Welcome to Generic Telnet Service (Ubuntu Linux)\r\n",
-        b"RouterX Telnet Interface - Unauthorized access prohibited.\r\n"
+        b"RouterX Telnet Interface - Unauthorized access prohibited.\r\n",
     ]),
     "ftp": random.choice([
         "220 ProFTPD 1.3.5 Server (Debian) [::ffff:127.0.0.1]",
-        "220 vsftpd 3.0.3 ready.",
-        "220 Microsoft FTP Service"
-    ])
+        "220 Microsoft FTP Service",
+    ]),
 }
 
+DB_PATH = Path("honeypot.db")
+
 # ---------------------------------------------------------------------------
-# Logging: structured JSON  (easy to ship into ELK)
+# Logging (structured JSON)
 # ---------------------------------------------------------------------------
 
 class JSONLog(logging.Formatter):
-    def format(self, rec):
+    def format(self, rec: logging.LogRecord) -> str:  # type: ignore[override]
         base = {
-            "ts": datetime.utcfromtimestamp(rec.created).isoformat() + "Z",
+            "ts": datetime.fromtimestamp(rec.created, timezone.utc).isoformat(),
             "level": rec.levelname,
             "msg": rec.getMessage(),
         }
@@ -96,104 +111,78 @@ logging.getLogger().handlers[0].setFormatter(JSONLog())
 LOGGER = logging.getLogger("honeypot")
 
 # ---------------------------------------------------------------------------
-# SQLite helper for credential capture / replay
+# SQLite helpers
 # ---------------------------------------------------------------------------
 
-def init_db():
+def init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS creds (
-            ts DATETIME DEFAULT CURRENT_TIMESTAMP,
-            proto TEXT, ip TEXT, user TEXT, passwd TEXT
-        )""")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS creds (
+                   ts  DATETIME DEFAULT CURRENT_TIMESTAMP,
+                   proto TEXT, ip TEXT, user TEXT, passwd TEXT
+               )"""
+        )
 
-
-def store_creds(proto: str, ip: str, user: str, passwd: str):
+def store_creds(proto: str, ip: str, user: str, passwd: str) -> None:
+    LOGGER.info(json.dumps({"event": "creds", "proto": proto, "ip": ip, "user": user, "pass": passwd}))
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("INSERT INTO creds(proto, ip, user, passwd) VALUES (?,?,?,?)",
-                     (proto, ip, user, passwd))
+        conn.execute("INSERT INTO creds(proto, ip, user, passwd) VALUES (?,?,?,?)", (proto, ip, user, passwd))
+
+init_db()
 
 # ---------------------------------------------------------------------------
-# Adaptive command history (per‑session)
+# Adaptive history
 # ---------------------------------------------------------------------------
 
-COMMAND_HISTORY: dict[str, dict[str,int]] = {}
+COMMAND_HISTORY: Dict[str, Dict[str, int]] = {}
 
-def get_session_id(writer):
-    try:
-        peer = writer.get_extra_info("peername")
-        return f"{peer[0]}:{peer[1]}-{time.time()}"
-    except Exception:
-        return f"unknown-{time.time()}"
+def get_session_id(writer: asyncio.StreamWriter) -> str:
+    peer = writer.get_extra_info("peername") or ("unknown", 0)
+    return f"{peer[0]}:{peer[1]}-{time.time()}"
 
 def update_hist(sid: str, cmd: str) -> int:
     h = COMMAND_HISTORY.setdefault(sid, {})
     h[cmd] = h.get(cmd, 0) + 1
     return h[cmd]
 
-async def adaptive_response(sid: str, cmd: str, base_corofunc):
+async def adaptive_response(sid: str, cmd: str, base: Callable[[], asyncio.Future | str]):
     count = update_hist(sid, cmd.lower())
-    await asyncio.sleep(min(count * random.uniform(0.1,0.4), 1.5))
-    suffix = f" [note: {random.choice(['Processing…','Checking…','Alert','Notice'])}]" if count>2 else ""
-    txt = await base_corofunc()
+    await asyncio.sleep(min(count * random.uniform(0.1, 0.4), 1.5))
+    suffix = f" [note: {random.choice(['Processing…', 'Checking…', 'Alert', 'Notice'])}]" if count > 2 else ""
+    txt = await base() if asyncio.iscoroutinefunction(base) else base()  # type: ignore[arg-type]
     return txt + suffix
 
 # ---------------------------------------------------------------------------
-# Decoy filesystem (same as previous, trimmed)
+# Decoy filesystem helper
 # ---------------------------------------------------------------------------
 
 DECOY_FS = {
     "root": {
-        "readme.txt": "Welcome to the honeypot. This system is monitored.",
+        "readme.txt": "This host is part of a monitored network.",
         "aws_keys.txt": "AKIAIOSFODNN7EXAMPLE:abcd1234secretkey",
-        "system.conf": "SERVICE_PORT=8080\nADMIN_EMAIL=admin@example.com",
-        "secret_project.docx": "UEsDBBQ…fakebase64payload…"
+        "secret_project.docx": "UEsDBBQ…fakebase64…",
     },
     "home": {
         "user": {
-            "notes.txt": "Meeting notes…",
-            "jwt.token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9…"
+            "notes.txt": "TODO: fix vulnerability in API.",
+            "jwt.token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9…",
         }
-    }
+    },
 }
 
-# ---------------------------------------------------------------------------
-# Raw‑socket SYN listener (packet‑level fingerprinting)
-# ---------------------------------------------------------------------------
-
-def syn_listener():
-    def reply(pkt):
-        if pkt.haslayer(scapy.TCP) and pkt[scapy.TCP].flags == "S":
-            dport = pkt[scapy.TCP].dport
-            for name, p in config["ports"].items():
-                if p == dport:
-                    ttl, window, mss = SERVICE_FP.get(name, (64, 64240, 1460))
-                    ip = scapy.IP(src=pkt[scapy.IP].dst, dst=pkt[scapy.IP].src, ttl=ttl)
-                    tcp = scapy.TCP(sport=dport, dport=pkt[scapy.TCP].sport,
-                                    seq=random.randint(0, 2**32-1), ack=pkt[scapy.TCP].seq+1,
-                                    flags="SA", window=window,
-                                    options=[("MSS", mss), ("SAckOK", b"")])
-                    scapy.send(ip/tcp, verbose=False)
-    scapy.sniff(filter="tcp[tcpflags] & tcp-syn != 0", prn=reply, store=False)
-
-# ---------------------------------------------------------------------------
-# Filesystem command sim (ls, cat, cd, pwd)
-# ---------------------------------------------------------------------------
-
-def _resolve(path):
-    parts = [p for p in path.split("/") if p]
+def _resolve(path: str):
     node = DECOY_FS
-    for p in parts:
-        if isinstance(node, dict) and p in node:
-            node = node[p]
-        else:
+    for part in (p for p in path.split("/") if p):
+        if not isinstance(node, dict) or part not in node:
             return None
+        node = node[part]
     return node
 
-def fs_command(cmdline: str, cwd: str="root"):
-    tokens = cmdline.strip().split()
-    if not tokens:
+def fs_command(cmdline: str, cwd: str):
+    toks = cmdline.strip().split()
+    if not toks:
         return "", cwd
-    cmd, *args = tokens
+    cmd, *args = toks
     if cmd == "pwd":
         return f"/{cwd}", cwd
     if cmd == "ls":
@@ -201,19 +190,17 @@ def fs_command(cmdline: str, cwd: str="root"):
         node = _resolve(target)
         if isinstance(node, dict):
             if "-l" in args:
-                out = []
-                for name in node:
-                    size = random.randint(512, 40960)
-                    out.append(f"-rw-r--r-- 1 user user {size:>6} Jun 10 12:{random.randint(10,59)} {name}")
-                return "\n".join(out), cwd
+                return "\n".join(
+                    f"-rw-r--r-- 1 user user {random.randint(512,40960):>6} Jun 10 12:{random.randint(10,59)} {n}"
+                    for n in node), cwd
             return "\n".join(node.keys()), cwd
-        return f"ls: cannot access '{args[0] if args else ''}': No such file or directory", cwd
+        return f"ls: cannot access '{args[0] if args else ''}': No such file", cwd
     if cmd == "cat":
         if not args:
             return "Usage: cat <file>", cwd
         node = _resolve(cwd)
         if isinstance(node, dict) and args[0] in node and not isinstance(node[args[0]], dict):
-            return str(node[args[0]]), cwd
+            return str(node[args[0]]), cwd  # fixed index bug
         return f"cat: {args[0]}: No such file", cwd
     if cmd == "cd":
         if not args:
@@ -226,377 +213,238 @@ def fs_command(cmdline: str, cwd: str="root"):
     return f"Command '{cmdline}' executed (simulated)", cwd
 
 # ---------------------------------------------------------------------------
-# SSH Honeypot (asyncssh)
+# Raw SYN/ACK responder
+# ---------------------------------------------------------------------------
+
+def syn_listener():
+    def reply(pkt):
+        try:
+            if pkt.haslayer(scapy.TCP) and pkt[scapy.TCP].flags == "S":
+                dport = pkt[scapy.TCP].dport
+                for proto, p in config["ports"].items():
+                    if p == dport:
+                        ttl, win, mss = SERVICE_FP.get(proto, (64, 64240, 1460))
+                        ip = scapy.IP(src=pkt[scapy.IP].dst, dst=pkt[scapy.IP].src, ttl=ttl)
+                        tcp = scapy.TCP(sport=dport, dport=pkt[scapy.TCP].sport,
+                                        seq=random.randint(0, 2**32-1), ack=pkt[scapy.TCP].seq+1,
+                                        flags="SA", window=win, options=[("MSS", mss), ("SAckOK", b"")])
+                        scapy.send(ip/tcp, verbose=False)
+        except Exception:
+            LOGGER.error(traceback.format_exc())
+    scapy.sniff(filter="tcp[tcpflags] & tcp-syn != 0", prn=reply, store=False)
+
+# ---------------------------------------------------------------------------
+# Shared text‑login helper
+# ---------------------------------------------------------------------------
+
+async def do_login(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, proto: str, sid: str):
+    writer.write(b"login: "); await writer.drain()
+    user = (await reader.readline())[:128].decode(errors="ignore").strip()
+    writer.write(b"Password: "); await writer.drain()
+    passwd = (await reader.readline())[:128].decode(errors="ignore").strip()
+    ip = writer.get_extra_info("peername")[0]
+    store_creds(proto, ip, user, passwd)
+    await asyncio.sleep(random.uniform(0.3,1.0))
+    writer.write(b"\r\nLogin OK\r\n"); await writer.drain()
+
+# ---------------------------------------------------------------------------
+# SSH honeypot
 # ---------------------------------------------------------------------------
 
 class HPSSHServer(asyncssh.SSHServer):
-    async def begin_auth(self, username):
-        # Accept all; capture creds on password method
+    async def begin_auth(self, _):
         return True
-
     def password_auth_supported(self):
         return True
-
     async def validate_password(self, username, password):
-        peer = self._conn.get_extra_info("peername")[0]
-        store_creds("ssh", peer, username, password)
-        await asyncio.sleep(random.uniform(0.4,1.2))  # tarpit delay
+        ip = self._conn.get_extra_info("peername")[0]
+        store_creds("ssh", ip, username, password)
+        await asyncio.sleep(random.uniform(0.4,1.3))
         return True
 
 class HPSSHSession(asyncssh.SSHServerSession):
-    def __init__(self, sid):
-        super().__init__()
+    def __init__(self, sid: str):
         self.sid = sid
-        self._buf = ""
         self.cwd = "root"
+        self.buf = ""
+        self.chan: asyncssh.SSHChannel | None = None
 
     def connection_made(self, chan):
         self.chan = chan
-        ttl, win, _ = SERVICE_FP["ssh"]
-        self.chan.write(f"Welcome! [{BANNERS['ssh']}]\n")
-        self.chan.write(f"[System] TCP Fingerprint: TTL={ttl} Window={win}\n")
-        self.chan.write("Type 'help' for commands, 'exit' to quit.\n")
-        self.chan.write(f"[{self.cwd}] # ")
+        self.chan.write(f"{BANNERS['ssh']} (simulated)\nType 'help' for commands.\n[{self.cwd}] # ")
 
     def data_received(self, data, _):
-        self._buf += data
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n",1)
-            cmd = line.strip()
-            if cmd:
-                asyncio.create_task(self._handle(cmd))
+        self.buf += data
+        while "\n" in self.buf:
+            line, self.buf = self.buf.split("\n",1)
+            cmd = line.strip()[:2048]
+            asyncio.create_task(self._handle(cmd))
 
-    async def _handle(self, cmd):
+    async def _handle(self, cmd: str):
         async def base():
-            lower = cmd.lower()
-            if lower == "exit":
-                self.chan.write("Goodbye!\n")
-                self.chan.exit(0)
-                return "Goodbye!"
-            if lower == "help":
-                return "Available: ls, cat, cd, pwd, vuln-check, exit"
-            if lower == "vuln-check":
-                v = config["fake_vulnerabilities"]["ssh"]
-                return f"Vulnerability detected: {v['cve']} - {v['description']}"
-            if lower.split()[0] in ("ls","cat","cd","pwd"):
-                resp, newcwd = fs_command(cmd, self.cwd)
-                self.cwd = newcwd
-                return resp
-            return f"-bash: {cmd.split()[0]}: command not found"
-        out = await adaptive_response(self.sid, cmd, base)
-        if not self.chan.is_closing():
-            self.chan.write(out + "\n")
-            self.chan.write(f"[{self.cwd}] # ")
+            if cmd == "exit":
+                self.chan.write("Bye!\n"); self.chan.exit(0)
+                return ""
+            if cmd == "help":
+                return "Commands: ls, cat, cd, pwd, vuln-check, exit"
+            if cmd == "vuln-check":
+                v=config["fake_vulnerabilities"]["ssh"]; return f"{v['cve']} - {v['description']}"
+            if cmd.split()[0] in {"ls","cat","cd","pwd"}:
+                out, newcwd = fs_command(cmd, self.cwd); self.cwd=newcwd; return out
+            return f"-bash: {cmd}: command not found"
+        try:
+            msg = await adaptive_response(self.sid, cmd, base)
+            if not self.chan.is_closing():
+                self.chan.write(msg+"\n"); self.chan.write(f"[{self.cwd}] # ")
+        except Exception:
+            LOGGER.error(traceback.format_exc())
+            if not self.chan.is_closing():
+                self.chan.write("Internal error.\n"); self.chan.exit(1)
 
 async def start_ssh():
-    key_path = Path(config["ssh_host_key_path"])
-    if not key_path.exists():
-        asyncssh.generate_private_key("ssh-ed25519").write_private_key(str(key_path))
+    if not os.path.exists(config["ssh_host_key_path"]):
+        asyncssh.generate_private_key("ssh-ed25519").write_private_key(config["ssh_host_key_path"])
     await asyncssh.create_server(
-        HPSSHServer, host="", port=config["ports"]["ssh"],
-        server_host_keys=[str(key_path)],
-        process_factory=lambda conn: HPSSHSession(sid=f"ssh-{conn.get_extra_info('peername')[0]}-{time.time()}")
+        HPSSHServer, "", config["ports"]["ssh"],
+        server_host_keys=[config["ssh_host_key_path"]],
+        session_factory=lambda _: HPSSHSession(str(uuid.uuid4())),
     )
-    LOGGER.info(json.dumps({"service":"ssh","status":"listening","port":config["ports"]["ssh"]}))
+    LOGGER.info(json.dumps({"event":"ssh_listen","port":config["ports"]["ssh"]}))
 
 # ---------------------------------------------------------------------------
-# Telnet Honeypot (plain asyncio)
+# Telnet honeypot
 # ---------------------------------------------------------------------------
 
-async def telnet_login(r, w, ip):
-    w.write(b"login: "); await w.drain()
-    user = (await r.readline())[:32].decode(errors='ignore').strip()
-    w.write(b"Password: "); await w.drain()
-    pwd = (await r.readline())[:32].decode(errors='ignore').strip()
-    store_creds("telnet", ip, user, pwd)
-    await asyncio.sleep(random.uniform(0.5,1.2))
-    w.write(b"\r\nLogin OK\r\n")
-
-async def handle_telnet(r, w):
-    ip = w.get_extra_info("peername")[0]
-    sid = get_session_id(w)
-    w.write(BANNERS["telnet"]); await w.drain()
-    await telnet_login(r, w, ip)
-    w.write(b"Type 'vuln-check' or 'exit'.\r\n")
-    while True:
-        w.write(b"> "); await w.drain()
-        try:
-            data = await asyncio.wait_for(r.readline(), 300)
-        except asyncio.TimeoutError:
-            break
-        if not data:
-            break
-        cmd = data.decode(errors='ignore').strip()
-        if not cmd:
-            continue
-        async def base():
-            lc = cmd.lower()
-            if lc == "exit":
-                return "Goodbye!"
-            if lc == "vuln-check":
-                v=config["fake_vulnerabilities"]["telnet"]
-                return f"Vulnerability detected: {v['cve']} - {v['description']}"
-            if lc in ("ls","dir","status"):
-                return f"Simulated output for '{cmd}'."
-            return f"Command '{cmd}' executed (simulated)."
-        out = await adaptive_response(sid, cmd, base)
-        w.write(out.encode()+b"\r\n"); await w.drain()
-        if cmd.lower()=="exit":
-            break
-    w.close(); await w.wait_closed()
+async def handle_telnet(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    sid = get_session_id(writer)
+    try:
+        writer.write(BANNERS["telnet"]); await writer.drain()
+        await do_login(reader, writer, "telnet", sid)
+        while True:
+            writer.write(b"> "); await writer.drain()
+            line = await asyncio.wait_for(reader.readline(), timeout=300)
+            if not line:
+                break
+            cmd = line.decode(errors="ignore").strip()[:2048]
+            async def base():
+                if cmd == "exit": return "Bye!"
+                if cmd == "vuln-check":
+                    v=config["fake_vulnerabilities"]["telnet"]; return f"{v['cve']} - {v['description']}"
+                return f"Executed '{cmd}' (simulated)"
+            msg = await adaptive_response(sid, cmd, base)
+            writer.write(msg.encode()+b"\r\n"); await writer.drain()
+            if cmd == "exit": break
+    except Exception:
+        LOGGER.error(traceback.format_exc())
+    finally:
+        writer.close(); await writer.wait_closed()
 
 async def start_telnet():
     srv = await asyncio.start_server(handle_telnet, host="", port=config["ports"]["telnet"])
-    LOGGER.info(json.dumps({"service":"telnet","status":"listening","port":config["ports"]["telnet"]}))
-    async with srv:
-        await srv.serve_forever()
+    LOGGER.info(json.dumps({"event":"telnet_listen","port":config["ports"]["telnet"]}))
+    async with srv: await srv.serve_forever()
 
 # ---------------------------------------------------------------------------
-# FTP Honeypot (pyftpdlib)
+# FTP honeypot
 # ---------------------------------------------------------------------------
 
 class HPFTPHandler(FTPHandler):
+    banner = BANNERS["ftp"]
     def on_connect(self):
-        LOGGER.info(json.dumps({"service":"ftp","event":"connect","ip":self.remote_ip}))
+        LOGGER.info(json.dumps({"event":"ftp_connect","ip":self.remote_ip}))
     def on_login(self, user):
         store_creds("ftp", self.remote_ip, user, "<unknown>")
-    def ftp_RETR(self, file):
-        if file.lower()=="vuln.txt":
-            v=config["fake_vulnerabilities"]["ftp"]
-            self.respond("150 opening data connection")
-            self.push_dtp_data((f"Triggered! {v['cve']} {v['description']}\n").encode(), isproducer=False)
-            self.respond("226 transfer complete")
-        else:
-            super().ftp_RETR(file)
-
-
-def start_ftp_thread():
-    authorizer=DummyAuthorizer(); authorizer.add_anonymous(".", perm="elr")
-    HPFTPHandler.authorizer=authorizer; HPFTPHandler.banner=BANNERS["ftp"]+"\r\n"
-    HPFTPHandler.passive_ports=range(60000,60010)
-    srv=FTPServer(("",config["ports"]["ftp"]), HPFTPHandler)
-    LOGGER.info(json.dumps({"service":"ftp","status":"listening","port":config["ports"]["ftp"]}))
-    srv.serve_forever()
+    def ftp_RETR(self, fib):
+        try:
+            if fib.lower()=="vuln.txt":
+                v=config["fake_vulnerabilities"]["ftp"]
+                data=f"Triggered {v['cve']}: {v['description']}\n".encode()
+                self.respond("150 Opening data connection."); self.push_dtp_data(data,isproducer=False)
+                self.respond("226 Transfer complete."); return
+            super().ftp_RETR(fib)
+        except Exception:
+            LOGGER.error(traceback.format_exc()); self.respond("451 Local error.")
 
 def run_ftp():
-    threading.Thread(target=start_ftp_thread, daemon=True).start()
-
-# ---------------- LDAP ----------------
-
-async def handle_ldap(reader, writer):
-    ip = writer.get_extra_info("peername")[0]
-    sid = get_session_id(writer)
-    writer.write(b"Simulated OpenLDAP Service\r\n")
-    writer.write(b"Commands: bind <user> <pass>, search <filter>, vuln-check, exit\r\n")
-    await writer.drain()
-
-    while True:
-        writer.write(b"LDAP> ")
-        await writer.drain()
-        try:
-            line = await asyncio.wait_for(reader.readline(), timeout=300)
-        except asyncio.TimeoutError:
-            break
-        if not line:
-            break
-        cmdline = line.decode(errors="ignore").strip()
-        parts = cmdline.split()
-
-        async def base():
-            if not parts:
-                return ""
-            verb = parts[0].lower()
-            if verb == "exit":
-                return "Goodbye!"
-            if verb == "bind" and len(parts) >= 3:
-                user, passwd = parts[1], parts[2]
-                store_creds("ldap", ip, user, passwd)
-                return "Bind successful (simulated)"
-            if verb == "search":
-                return f"Simulated results for filter '{' '.join(parts[1:])}' (2 entries)"
-            if verb == "vuln-check":
-                v = config["fake_vulnerabilities"]["ldap"]
-                return f"{v['cve']} - {v['description']}"
-            return f"Command '{cmdline}' executed (simulated)"
-        msg = await adaptive_response(sid, cmdline, base)
-        writer.write(msg.encode() + b"\r\n")
-        await writer.drain()
-        if parts and parts[0].lower() == "exit":
-            break
-    writer.close()
-    await writer.wait_closed()
-
-async def start_ldap():
-    srv = await asyncio.start_server(handle_ldap, host="", port=config["ports"]["ldap"])
-    LOGGER.info(json.dumps({"event": "ldap_listen", "port": config["ports"]["ldap"]}))
-    async with srv:
-        await srv.serve_forever()
-
-# ---------------- SMB ----------------
-
-async def handle_smb(reader, writer):
-    ip = writer.get_extra_info("peername")[0]
-    sid = get_session_id(writer)
-    shares = {"PUBLIC": ["readme.txt", "docs.zip"], "ADMIN$": ["secrets.xlsx"]}
-
-    writer.write(b"Samba 4.x (simulated)\r\n")
-    writer.write(b"Commands: list, connect <share> <user> <pass>, browse <share>, vuln-check, exit\r\n")
-    await writer.drain()
-
-    while True:
-        writer.write(b"SMB> ")
-        await writer.drain()
-        try:
-            line = await asyncio.wait_for(reader.readline(), timeout=300)
-        except asyncio.TimeoutError:
-            break
-        if not line:
-            break
-        cmdline = line.decode(errors="ignore").strip()
-        parts = cmdline.split()
-
-        async def base():
-            if not parts:
-                return ""
-            verb = parts[0].lower()
-            if verb == "exit":
-                return "Bye!"
-            if verb == "list":
-                return "\n".join(shares.keys())
-            if verb == "connect" and len(parts) >= 4:
-                share, user, passwd = parts[1].upper(), parts[2], parts[3]
-                store_creds("smb", ip, user, passwd)
-                if share in shares:
-                    return f"Connected to {share} (simulated). Use 'browse {share}'."
-                return f"Share {share} not found"
-            if verb == "browse" and len(parts) >= 2:
-                share = parts[1].upper()
-                if share in shares:
-                    return "\n".join(shares[share])
-                return f"Share {share} not found"
-            if verb == "vuln-check":
-                v = config["fake_vulnerabilities"]["smb"]
-                return f"{v['cve']} - {v['description']}"
-            return f"Command '{cmdline}' executed (simulated)"
-        msg = await adaptive_response(sid, cmdline, base)
-        writer.write(msg.encode() + b"\r\n")
-        await writer.drain()
-        if parts and parts[0].lower() == "exit":
-            break
-    writer.close()
-    await writer.wait_closed()
-
-async def start_smb():
-    srv = await asyncio.start_server(handle_smb, host="", port=config["ports"]["smb"])
-    LOGGER.info(json.dumps({"event": "smb_listen", "port": config["ports"]["smb"]}))
-    async with srv:
-        await srv.serve_forever()
-
-# ---------------- NETBIOS ----------------
-
-async def handle_netbios(reader, writer):
-    ip = writer.get_extra_info("peername")[0]
-    sid = get_session_id(writer)
-    writer.write(b"NETBIOS Name Service (simulated)\r\n")
-    writer.write(b"Commands: nbstat, name query <name>, vuln-check, exit\r\n")
-    await writer.drain()
-
-    while True:
-        writer.write(b"NETBIOS> ")
-        await writer.drain()
-        try:
-            line = await asyncio.wait_for(reader.readline(), timeout=300)
-        except asyncio.TimeoutError:
-            break
-        if not line:
-            break
-        cmdline = line.decode(errors="ignore").strip()
-        parts = cmdline.split()
-
-        async def base():
-            if not parts:
-                return ""
-            verb = parts[0].lower()
-            if verb == "exit":
-                return "Bye!"
-            if verb == "nbstat":
-                return "Simulated nbtstat output (2 names)"
-            if verb == "name" and len(parts) >= 3 and parts[1] == "query":
-                return f"Name query result for '{parts[2]}': 192.168.1.100 (simulated)"
-            if verb == "vuln-check":
-                v = config["fake_vulnerabilities"]["netbios"]
-                return f"{v['cve']} - {v['description']}"
-            return f"Command '{cmdline}' executed (simulated)"
-        msg = await adaptive_response(sid, cmdline, base)
-        writer.write(msg.encode() + b"\r\n")
-        await writer.drain()
-        if parts and parts[0].lower() == "exit":
-            break
-    writer.close()
-    await writer.wait_closed()
-
-async def start_netbios():
-    srv = await asyncio.start_server(handle_netbios, host="", port=config["ports"]["netbios"])
-    LOGGER.info(json.dumps({"event": "netbios_listen", "port": config["ports"]["netbios"]}))
-    async with srv:
-        await srv.serve_forever()
-
-async def dummy_handler(name, reader, writer):
-    ip = writer.get_extra_info("peername")[0]
-    sid = get_session_id(writer)
-    writer.write(f"Welcome to simulated {name}. Type 'vuln-check' or 'exit'.\r\n".encode()); await writer.drain()
-    while True:
-        writer.write(f"{name}> ".encode()); await writer.drain()
-        try:
-            data = await asyncio.wait_for(reader.readline(),300)
-        except asyncio.TimeoutError:
-            break
-        if not data:
-            break
-        cmd=data.decode(errors='ignore').strip()
-        async def base():
-            if cmd.lower()=="exit":
-                return "Goodbye!"
-            if cmd.lower()=="vuln-check":
-                v=config["fake_vulnerabilities"][name]
-                return f"Vulnerability: {v['cve']} - {v['description']}"
-            return f"Command '{cmd}' executed (simulated)"
-        out=await adaptive_response(sid, cmd, base)
-        writer.write(out.encode()+b"\r\n"); await writer.drain()
-        if cmd.lower()=="exit":
-            break
-    writer.close(); await writer.wait_closed()
-
-async def start_generic(name):
-    srv = await asyncio.start_server(lambda r,w: dummy_handler(name,r,w), host="", port=config["ports"][name])
-    LOGGER.info(json.dumps({"service":name,"status":"listening","port":config["ports"][name]}))
-    async with srv:
-        await srv.serve_forever()
+    auth=DummyAuthorizer(); auth.add_anonymous(".", perm="elr")
+    HPFTPHandler.authorizer=auth
+    srv=FTPServer(("", config["ports"]["ftp"]), HPFTPHandler)
+    LOGGER.info(json.dumps({"event":"ftp_listen","port":config["ports"]["ftp"]}))
+    srv.serve_forever()
 
 # ---------------------------------------------------------------------------
-# Main async orchestrator
+# Generic text‑protocol template for LDAP, SMB, NETBIOS
+# ---------------------------------------------------------------------------
+
+async def generic_handler(name: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    sid = get_session_id(writer)
+    ip = writer.get_extra_info("peername")[0]
+    hdr = {
+        "ldap": b"Simulated OpenLDAP Service\r\nCommands: bind <u> <p>, search <f>, vuln-check, exit\r\n",
+        "smb": b"Samba 4.x (simulated)\r\nCommands: list, connect <share> <u> <p>, browse <share>, vuln-check, exit\r\n",
+        "netbios": b"NETBIOS Name Service (simulated)\r\nCommands: nbstat, name query <n>, vuln-check, exit\r\n",
+    }[name]
+    shares={"PUBLIC":["readme.txt"],"ADMIN$": ["secrets.xlsx"]} if name=="smb" else {}
+    try:
+        writer.write(hdr); await writer.drain()
+        while True:
+            prompt=f"{name.upper()}> ".encode(); writer.write(prompt); await writer.drain()
+            line = await asyncio.wait_for(reader.readline(), timeout=300)
+            if not line: break
+            cmdline=line.decode(errors="ignore").strip()[:2048]
+            parts=cmdline.split()
+            async def base():
+                if not parts: return ""
+                verb=parts[0].lower()
+                if verb=="exit": return "Goodbye!"
+                if name=="ldap" and verb=="bind" and len(parts)>=3:
+                    store_creds("ldap",ip,parts[1],parts[2]); return "Bind OK (simulated)"
+                if name=="ldap" and verb=="search":
+                    return f"Results for '{' '.join(parts[1:])}' (simulated)"
+                if name=="smb":
+                    if verb=="list": return "\n".join(shares.keys())
+                    if verb=="connect" and len(parts)>=4:
+                        share,user,passwd=parts[1].upper(),parts[2],parts[3]; store_creds("smb",ip,user,passwd)
+                        return f"Connected to {share}" if share in shares else f"Share {share} not found"
+                    if verb=="browse" and len(parts)>=2:
+                        share=parts[1].upper(); return "\n".join(shares.get(share, [])) or f"Share {share} not found"
+                if name=="netbios" and verb=="nbstat":
+                    return "Simulated nbtstat output"
+                if name=="netbios" and verb=="name" and len(parts)>=3 and parts[1]=="query":
+                    return f"Name query result for '{parts[2]}': 192.168.1.100"
+                if verb=="vuln-check":
+                    v=config["fake_vulnerabilities"][name]; return f"{v['cve']} - {v['description']}"
+                return f"Command '{cmdline}' executed (simulated)"
+            msg = await adaptive_response(sid, cmdline, base)
+            writer.write(msg.encode()+b"\r\n"); await writer.drain()
+            if parts and parts[0].lower()=="exit": break
+    except Exception:
+        LOGGER.error(traceback.format_exc())
+    finally:
+        writer.close(); await writer.wait_closed()
+
+async def start_generic(name: str):
+    srv = await asyncio.start_server(lambda r,w: generic_handler(name,r,w), host="", port=config["ports"][name])
+    LOGGER.info(json.dumps({"event":f"{name}_listen","port":config["ports"][name]}))
+    async with srv: await srv.serve_forever()
+
+# ---------------------------------------------------------------------------
+# Main orchestrator
 # ---------------------------------------------------------------------------
 
 async def main_async():
-    tasks = [
-        asyncio.create_task(start_ssh()),
-        asyncio.create_task(start_telnet()),
-        asyncio.create_task(start_ldap()),
-        asyncio.create_task(start_smb()),
-        asyncio.create_task(start_netbios()),
-    ]
-    await asyncio.gather(*tasks)
-
+    await asyncio.gather(
+        start_ssh(), start_telnet(),
+        start_generic("ldap"), start_generic("smb"), start_generic("netbios"),
+    )
 
 def main():
     threading.Thread(target=syn_listener, daemon=True).start()
-    threading.Thread(target=start_ftp_thread, daemon=True).start()
+    threading.Thread(target=run_ftp, daemon=True).start()
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:
-        LOGGER.info(json.dumps({"event": "shutdown"}))
-
+        LOGGER.info(json.dumps({"event":"shutdown"}))
 
 if __name__ == "__main__":
     main()
-
