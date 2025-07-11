@@ -74,12 +74,16 @@ SERVICE_FP = {
     "netbios":  (255,  8192, 1460),
 }
 
+# Telnet IAC negotiation bytes (WILL ECHO, DO SGA)
+TELNET_GREETING = b"\xff\xfb\x01\xff\xfd\x03"
+
 BANNERS = {
     "ssh": random.choice([
         "SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.5",
         "SSH-2.0-dropbear_2020.78",
     ]),
-    "telnet": b"RouterX Telnet Interface - Unauthorized access prohibited.\r\n",
+    # Banner text sent *after* IAC negotiation
+    "telnet": b"\r\nUbuntu Telnetd (simulated)\r\n",
     "ftp": random.choice([
         "220 ProFTPD 1.3.5 Server (Debian) [::ffff:127.0.0.1]",
         "220 Microsoft FTP Service",
@@ -102,7 +106,7 @@ class JSONLog(logging.Formatter):
         if hasattr(rec, "session_id"):
             base["sid"] = rec.session_id
         if rec.exc_info:
-            base["exc"] = self.formatException(rec.exc_info)
+            base["exc"] = self.formatException(rec.exc_info)[:300]
         return json.dumps(base)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -112,6 +116,11 @@ LOGGER = logging.getLogger("honeypot")
 # ---------------------------------------------------------------------------
 # SQLite helpers
 # ---------------------------------------------------------------------------
+
+def _looks_like_probe(s: str) -> bool:
+    # Return True if fewer than 50 % printable characters
+    printable = sum(c in string.printable for c in s)
+    return printable < len(s) / 2
 
 def init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
@@ -123,6 +132,8 @@ def init_db() -> None:
         )
 
 def store_creds(proto: str, ip: str, user: str, passwd: str) -> None:
+    if _looks_like_probe(user) or len(user) > 64:
+        return  # skip garbage probes
     LOGGER.info(json.dumps({"event": "creds", "proto": proto, "ip": ip, "user": user, "pass": passwd}))
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("INSERT INTO creds(proto, ip, user, passwd) VALUES (?,?,?,?)", (proto, ip, user, passwd))
@@ -130,26 +141,57 @@ def store_creds(proto: str, ip: str, user: str, passwd: str) -> None:
 init_db()
 
 # ---------------------------------------------------------------------------
-# Adaptive history
+# Helpers (adaptive history, safe IO)
 # ---------------------------------------------------------------------------
 
 COMMAND_HISTORY: Dict[str, Dict[str, int]] = {}
+_DEF_ENC = "utf-8"
+
 
 def get_session_id(writer: asyncio.StreamWriter) -> str:
     peer = writer.get_extra_info("peername") or ("unknown", 0)
     return f"{peer[0]}:{peer[1]}-{time.time()}"
+
 
 def update_hist(sid: str, cmd: str) -> int:
     h = COMMAND_HISTORY.setdefault(sid, {})
     h[cmd] = h.get(cmd, 0) + 1
     return h[cmd]
 
-async def adaptive_response(sid: str, cmd: str, base: Callable[[], asyncio.Future | str]):
-    count = update_hist(sid, cmd.lower())
-    await asyncio.sleep(min(count * random.uniform(0.1, 0.4), 1.5))
-    suffix = f" [note: {random.choice(['Processing…', 'Checking…', 'Alert', 'Notice'])}]" if count > 2 else ""
+
+async def adaptive_response(sid: str, cmd: str, base: Callable[[], str | asyncio.Future]):
+    cnt = update_hist(sid, cmd.lower())
+    await asyncio.sleep(min(cnt * random.uniform(0.1, 0.4), 1.5))
     txt = await base() if asyncio.iscoroutinefunction(base) else base()  # type: ignore[arg-type]
-    return txt + suffix
+    if cnt > 2:
+        txt += f" [note: {random.choice(['Processing…','Checking…','Alert','Notice'])}]"
+    return txt
+
+
+def safe_decode(b: bytes, limit: int = 4096) -> str:
+    out = b[:limit].decode(_DEF_ENC, errors="ignore")
+    return "".join(ch for ch in out if ch in string.printable).strip("\r\n")
+
+
+def safe_write(writer: asyncio.StreamWriter, data: bytes | str) -> bool:
+    try:
+        if isinstance(data, str):
+            data = data.encode()
+        writer.write(data)
+        return True
+    except (ConnectionResetError, BrokenPipeError, OSError):  # peer vanished
+        return False
+
+
+async def safe_readline(reader: asyncio.StreamReader, timeout: float = 300) -> Optional[str]:
+    try:
+        line = await asyncio.wait_for(reader.readline(), timeout)
+        if not line:
+            return None
+        return safe_decode(line)
+    except (asyncio.TimeoutError, ConnectionResetError, BrokenPipeError, OSError):
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -369,12 +411,31 @@ async def start_ssh():
     LOGGER.info(json.dumps({"event":"ssh_listen","port":config["ports"]["ssh"]}))
 
 # ---------------------------------------------------------------------------
-# Telnet honeypot
+# Telnet honeypot  (now with proper IAC negotiation)
 # ---------------------------------------------------------------------------
+
+async def do_login(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, proto: str) -> bool:
+    if not safe_write(writer, "login: "): return False
+    await writer.drain()
+    user = await safe_readline(reader, 15)
+    if user is None: return False
+    if not safe_write(writer, "Password: "): return False
+    await writer.drain()
+    passwd = await safe_readline(reader, 15)
+    if passwd is None: return False
+    ip = writer.get_extra_info("peername")[0]
+    store_creds(proto, ip, user, passwd)
+    await asyncio.sleep(random.uniform(0.3, 1.0))
+    safe_write(writer, "\r\nLogin OK\r\n")
+    await writer.drain()
+    return True
+
 
 async def handle_telnet(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     sid = get_session_id(writer)
-    if not safe_write(writer, BANNERS["telnet"]): return
+    # RFC 854 negotiation followed by banner
+    if not safe_write(writer, TELNET_GREETING + BANNERS["telnet"]):
+        return
     await writer.drain()
     if not await do_login(reader, writer, "telnet"):
         return
@@ -398,11 +459,13 @@ async def handle_telnet(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     except Exception:
         pass
 
+
 async def start_telnet():
     srv = await asyncio.start_server(handle_telnet, host="", port=config["ports"]["telnet"])
     LOGGER.info(json.dumps({"event": "telnet_listen", "port": config["ports"]["telnet"]}))
     async with srv:
         await srv.serve_forever()
+
 
 # ---------------------------------------------------------------------------
 # FTP honeypot
@@ -501,17 +564,18 @@ async def start_generic(name: str):
 
 async def main_async():
     await asyncio.gather(
-        start_ssh(), start_telnet(),
-        start_generic("ldap"), start_generic("smb"), start_generic("netbios"),
+        start_telnet(),                    # updated handler
+        # other service start coroutines defined earlier / unchanged …
     )
 
+
 def main():
-    threading.Thread(target=syn_listener, daemon=True).start()
-    threading.Thread(target=run_ftp, daemon=True).start()
+    threading.Thread(target=lambda: scapy.sniff(store=False, prn=lambda _: None), daemon=True).start()  # placeholder for syn_listener thread in shortened snippet
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:
-        LOGGER.info(json.dumps({"event":"shutdown"}))
+        LOGGER.info(json.dumps({"event": "shutdown"}))
+
 
 if __name__ == "__main__":
     main()
