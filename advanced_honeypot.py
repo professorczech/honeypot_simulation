@@ -47,7 +47,7 @@ from pyftpdlib.servers import FTPServer
 import scapy.all as scapy  # raw‑packet SYN/ACK fingerprints
 
 # ---------------------------------------------------------------------------
-# Config
+# Config & constants
 # ---------------------------------------------------------------------------
 
 config: Dict = {
@@ -104,6 +104,8 @@ class JSONLog(logging.Formatter):
         }
         if hasattr(rec, "session_id"):
             base["sid"] = rec.session_id
+        if rec.exc_info:
+            base["exc"] = self.formatException(rec.exc_info)
         return json.dumps(base)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -151,6 +153,43 @@ async def adaptive_response(sid: str, cmd: str, base: Callable[[], asyncio.Futur
     suffix = f" [note: {random.choice(['Processing…', 'Checking…', 'Alert', 'Notice'])}]" if count > 2 else ""
     txt = await base() if asyncio.iscoroutinefunction(base) else base()  # type: ignore[arg-type]
     return txt + suffix
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+COMMAND_HISTORY: Dict[str, Dict[str, int]] = {}
+
+def get_session_id(writer: asyncio.StreamWriter) -> str:
+    peer = writer.get_extra_info("peername") or ("unknown", 0)
+    return f"{peer[0]}:{peer[1]}-{time.time()}"
+
+def update_hist(sid: str, cmd: str) -> int:
+    h = COMMAND_HISTORY.setdefault(sid, {})
+    h[cmd] = h.get(cmd, 0) + 1
+    return h[cmd]
+
+async def adaptive_response(sid: str, cmd: str, base: Callable[[], str | asyncio.Future]):
+    cnt = update_hist(sid, cmd.lower())
+    await asyncio.sleep(min(cnt * random.uniform(0.1, 0.4), 1.5))
+    txt = await base() if asyncio.iscoroutinefunction(base) else base()  # type: ignore[arg-type]
+    if cnt > 2:
+        txt += f" [note: {random.choice(['Processing…','Checking…','Alert','Notice'])}]"
+    return txt
+
+_DEF_ENC = "utf-8"
+
+def safe_decode(b: bytes, limit: int = 4096) -> str:
+    """Return a best‑effort UTF‑8 string from raw bytes."""
+    return b[:limit].decode(_DEF_ENC, errors="ignore").strip("\r\n")
+
+def safe_write(writer: asyncio.StreamWriter, data: bytes | str):
+    try:
+        if isinstance(data, str):
+            data = data.encode()
+        writer.write(data)
+    except (ConnectionResetError, BrokenPipeError):
+        pass
 
 # ---------------------------------------------------------------------------
 # Decoy filesystem helper
@@ -234,18 +273,27 @@ def syn_listener():
     scapy.sniff(filter="tcp[tcpflags] & tcp-syn != 0", prn=reply, store=False)
 
 # ---------------------------------------------------------------------------
-# Shared text‑login helper
+# Shared text‑login helper (now returns success flag)
 # ---------------------------------------------------------------------------
 
-async def do_login(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, proto: str, sid: str):
-    writer.write(b"login: "); await writer.drain()
-    user = (await reader.readline())[:128].decode(errors="ignore").strip()
-    writer.write(b"Password: "); await writer.drain()
-    passwd = (await reader.readline())[:128].decode(errors="ignore").strip()
-    ip = writer.get_extra_info("peername")[0]
-    store_creds(proto, ip, user, passwd)
-    await asyncio.sleep(random.uniform(0.3,1.0))
-    writer.write(b"\r\nLogin OK\r\n"); await writer.drain()
+async def do_login(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, proto: str) -> bool:
+    try:
+        safe_write(writer, b"login: "); await writer.drain()
+        user_b = await asyncio.wait_for(reader.readline(), timeout=15)
+        if not user_b: return False
+        user = safe_decode(user_b, 128)
+        safe_write(writer, b"Password: "); await writer.drain()
+        passwd_b = await asyncio.wait_for(reader.readline(), timeout=15)
+        if not passwd_b: return False
+        passwd = safe_decode(passwd_b, 128)
+        ip = writer.get_extra_info("peername")[0]
+        store_creds(proto, ip, user, passwd)
+        await asyncio.sleep(random.uniform(0.3, 1.0))
+        safe_write(writer, "\r\nLogin OK\r\n")
+        await writer.drain()
+        return True
+    except (asyncio.TimeoutError, ConnectionResetError, BrokenPipeError):
+        return False
 
 # ---------------------------------------------------------------------------
 # SSH honeypot
@@ -312,37 +360,47 @@ async def start_ssh():
     LOGGER.info(json.dumps({"event":"ssh_listen","port":config["ports"]["ssh"]}))
 
 # ---------------------------------------------------------------------------
-# Telnet honeypot
+# Telnet honeypot (fully wrapped)
 # ---------------------------------------------------------------------------
 
 async def handle_telnet(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     sid = get_session_id(writer)
     try:
-        writer.write(BANNERS["telnet"]); await writer.drain()
-        await do_login(reader, writer, "telnet", sid)
+        safe_write(writer, BANNERS["telnet"]); await writer.drain()
+        if not await do_login(reader, writer, "telnet"):
+            return
         while True:
-            writer.write(b"> "); await writer.drain()
-            line = await asyncio.wait_for(reader.readline(), timeout=300)
+            safe_write(writer, b"> "); await writer.drain()
+            try:
+                line = await asyncio.wait_for(reader.readline(), timeout=300)
+            except asyncio.TimeoutError:
+                break
             if not line:
                 break
-            cmd = line.decode(errors="ignore").strip()[:2048]
+            cmd = safe_decode(line)
             async def base():
-                if cmd == "exit": return "Bye!"
+                if cmd == "exit":
+                    return "Bye!"
                 if cmd == "vuln-check":
-                    v=config["fake_vulnerabilities"]["telnet"]; return f"{v['cve']} - {v['description']}"
+                    v = config["fake_vulnerabilities"]["telnet"]; return f"{v['cve']} - {v['description']}"
                 return f"Executed '{cmd}' (simulated)"
             msg = await adaptive_response(sid, cmd, base)
-            writer.write(msg.encode()+b"\r\n"); await writer.drain()
-            if cmd == "exit": break
+            safe_write(writer, msg + "\r\n"); await writer.drain()
+            if cmd == "exit":
+                break
     except Exception:
         LOGGER.error(traceback.format_exc())
     finally:
-        writer.close(); await writer.wait_closed()
+        try:
+            writer.close(); await writer.wait_closed()
+        except Exception:
+            pass
 
 async def start_telnet():
     srv = await asyncio.start_server(handle_telnet, host="", port=config["ports"]["telnet"])
-    LOGGER.info(json.dumps({"event":"telnet_listen","port":config["ports"]["telnet"]}))
-    async with srv: await srv.serve_forever()
+    LOGGER.info(json.dumps({"event": "telnet_listen", "port": config["ports"]["telnet"]}))
+    async with srv:
+        await srv.serve_forever()
 
 # ---------------------------------------------------------------------------
 # FTP honeypot
@@ -373,7 +431,7 @@ def run_ftp():
     srv.serve_forever()
 
 # ---------------------------------------------------------------------------
-# Generic text‑protocol template for LDAP, SMB, NETBIOS
+# Generic text‑protocol handler (LDAP, SMB, NETBIOS) now uses safe_* wrappers
 # ---------------------------------------------------------------------------
 
 async def generic_handler(name: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -384,49 +442,58 @@ async def generic_handler(name: str, reader: asyncio.StreamReader, writer: async
         "smb": b"Samba 4.x (simulated)\r\nCommands: list, connect <share> <u> <p>, browse <share>, vuln-check, exit\r\n",
         "netbios": b"NETBIOS Name Service (simulated)\r\nCommands: nbstat, name query <n>, vuln-check, exit\r\n",
     }[name]
-    shares={"PUBLIC":["readme.txt"],"ADMIN$": ["secrets.xlsx"]} if name=="smb" else {}
+    shares = {"PUBLIC": ["readme.txt"], "ADMIN$": ["secrets.xlsx"]} if name == "smb" else {}
     try:
-        writer.write(hdr); await writer.drain()
+        safe_write(writer, hdr); await writer.drain()
         while True:
-            prompt=f"{name.upper()}> ".encode(); writer.write(prompt); await writer.drain()
-            line = await asyncio.wait_for(reader.readline(), timeout=300)
-            if not line: break
-            cmdline=line.decode(errors="ignore").strip()[:2048]
-            parts=cmdline.split()
+            safe_write(writer, f"{name.upper()}> "); await writer.drain()
+            try:
+                line = await asyncio.wait_for(reader.readline(), timeout=300)
+            except asyncio.TimeoutError:
+                break
+            if not line:
+                break
+            cmdline = safe_decode(line)
+            parts = cmdline.split()
             async def base():
                 if not parts: return ""
-                verb=parts[0].lower()
-                if verb=="exit": return "Goodbye!"
-                if name=="ldap" and verb=="bind" and len(parts)>=3:
-                    store_creds("ldap",ip,parts[1],parts[2]); return "Bind OK (simulated)"
-                if name=="ldap" and verb=="search":
+                verb = parts[0].lower()
+                if verb == "exit": return "Goodbye!"
+                if name == "ldap" and verb == "bind" and len(parts) >= 3:
+                    store_creds("ldap", ip, parts[1], parts[2]); return "Bind OK (simulated)"
+                if name == "ldap" and verb == "search":
                     return f"Results for '{' '.join(parts[1:])}' (simulated)"
-                if name=="smb":
-                    if verb=="list": return "\n".join(shares.keys())
-                    if verb=="connect" and len(parts)>=4:
-                        share,user,passwd=parts[1].upper(),parts[2],parts[3]; store_creds("smb",ip,user,passwd)
-                        return f"Connected to {share}" if share in shares else f"Share {share} not found"
-                    if verb=="browse" and len(parts)>=2:
-                        share=parts[1].upper(); return "\n".join(shares.get(share, [])) or f"Share {share} not found"
-                if name=="netbios" and verb=="nbstat":
+                if name == "smb":
+                    if verb == "list": return "\n".join(shares.keys())
+                    if verb == "connect" and len(parts) >= 4:
+                        share, user, passwd = parts[1].upper(), parts[2], parts[3]
+                        store_creds("smb", ip, user, passwd)
+                        return "Connected" if share in shares else f"Share {share} not found"
+                    if verb == "browse" and len(parts) >= 2:
+                        share = parts[1].upper(); return "\n".join(shares.get(share, [])) or f"Share {share} not found"
+                if name == "netbios" and verb == "nbstat":
                     return "Simulated nbtstat output"
-                if name=="netbios" and verb=="name" and len(parts)>=3 and parts[1]=="query":
+                if name == "netbios" and verb == "name" and len(parts) >= 3 and parts[1] == "query":
                     return f"Name query result for '{parts[2]}': 192.168.1.100"
-                if verb=="vuln-check":
-                    v=config["fake_vulnerabilities"][name]; return f"{v['cve']} - {v['description']}"
+                if verb == "vuln-check":
+                    v = config["fake_vulnerabilities"][name]; return f"{v['cve']} - {v['description']}"
                 return f"Command '{cmdline}' executed (simulated)"
             msg = await adaptive_response(sid, cmdline, base)
-            writer.write(msg.encode()+b"\r\n"); await writer.drain()
-            if parts and parts[0].lower()=="exit": break
+            safe_write(writer, msg + "\r\n"); await writer.drain()
+            if parts and parts[0].lower() == "exit": break
     except Exception:
         LOGGER.error(traceback.format_exc())
     finally:
-        writer.close(); await writer.wait_closed()
+        try:
+            writer.close(); await writer.wait_closed()
+        except Exception:
+            pass
 
 async def start_generic(name: str):
-    srv = await asyncio.start_server(lambda r,w: generic_handler(name,r,w), host="", port=config["ports"][name])
-    LOGGER.info(json.dumps({"event":f"{name}_listen","port":config["ports"][name]}))
-    async with srv: await srv.serve_forever()
+    srv = await asyncio.start_server(lambda r, w: generic_handler(name, r, w), host="", port=config["ports"][name])
+    LOGGER.info(json.dumps({"event": f"{name}_listen", "port": config["ports"][name]}))
+    async with srv:
+        await srv.serve_forever()
 
 # ---------------------------------------------------------------------------
 # Main orchestrator
