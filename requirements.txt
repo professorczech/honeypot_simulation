@@ -1,2 +1,6 @@
 asyncssh
 pyftpdlib
+scapy 
+impacket 
+asyncssh 
+sqlite-utils
